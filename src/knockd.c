@@ -57,6 +57,7 @@
 #include <pcap.h>
 #include <errno.h>
 #include "list.h"
+#include <libipset/ipset.h>
 
 #if __APPLE__
 #undef daemon
@@ -65,9 +66,10 @@ extern int daemon(int, int);
 
 static char version[] = "0.8";
 
-#define SEQ_TIMEOUT 25 /* default knock timeout in seconds */
-#define CMD_TIMEOUT 10 /* default timeout in seconds between start and stop commands */
-#define SEQ_MAX     32 /* maximum number of ports in a knock sequence */
+#define SEQ_TIMEOUT   25 /* default knock timeout in seconds */
+#define CMD_TIMEOUT   10 /* default timeout in seconds between start and stop commands */
+#define IPSET_TIMEOUT 10 /* default timeout in seconds between ipset add and del commands */
+#define SEQ_MAX       32 /* maximum number of ports in a knock sequence */
 
 typedef enum _flag_stat {
 	DONT_CARE,  /* 0 */
@@ -86,8 +88,10 @@ typedef struct opendoor {
 	char *start_command;
 	char *start_command6;
 	time_t cmd_timeout;
+	time_t ipset_timeout;
 	char *stop_command;
 	char *stop_command6;
+	char *ipset_name;
 	flag_stat flag_fin;
 	flag_stat flag_syn;
 	flag_stat flag_rst;
@@ -141,6 +145,9 @@ size_t parse_cmd(char *dest, size_t size, const char *command, const char *src);
 int exec_cmd(char *command, char *name);
 void sniff(u_char *arg, const struct pcap_pkthdr *hdr, const u_char *packet);
 int target_strcmp(char *ip, char *target);
+int ipset_printf_custom(struct ipset *ipset, void *p, int status, const char *msg, ...) __attribute__ ((format (printf, 4, 5)));
+int ipset_printf_error(struct ipset *ipset, void *p);
+int ipset_printf_out(struct ipset_session *session, void *p, const char *fmt, ...) __attribute__ ((format (printf, 3, 4)));
 
 pcap_t *cap = NULL;
 FILE *logfd = NULL;
@@ -167,6 +174,10 @@ char o_cfg[PATH_MAX]     = "/etc/knockd.conf";
 char o_pidfile[PATH_MAX] = "/var/run/knockd.pid";
 char o_logfile[PATH_MAX] = "";
 
+static struct ipset *ipset				= NULL;
+static char ipset_error_buf[512]	= "";
+static int ipset_error_status			= -1;
+
 int main(int argc, char **argv)
 {
 	struct ifaddrs *ifaddr, *ifa;
@@ -189,6 +200,14 @@ int main(int argc, char **argv)
 		{"version",   no_argument,       0, 'V'},
 		{0, 0, 0, 0}
 	};
+
+  ipset = ipset_init();
+	if(!ipset) {
+		perror("ipset_init");
+		exit(1);
+	} else {
+	  ipset_custom_printf(ipset, ipset_printf_custom, ipset_printf_error, ipset_printf_out, NULL);
+	}
 
 	while((opt = getopt_long(argc, argv, "4vDdli:c:p:g:hV", opts, &optidx))) {
 		if(opt < 0) {
@@ -441,6 +460,8 @@ void cleanup(int signum)
 		free(myip);
 	}
 
+  ipset_fini(ipset);
+
 	exit(signum);
 }
 
@@ -613,8 +634,10 @@ int parseconfig(char *configfile)
 				door->start_command = NULL;
 				door->start_command6 = NULL;
 				door->cmd_timeout = CMD_TIMEOUT; /* default command timeout (seconds) */
+				door->ipset_timeout = IPSET_TIMEOUT; /* default ipset timeout (seconds) */
 				door->stop_command = NULL;
 				door->stop_command6 = NULL;
+				door->ipset_name = NULL;
 				door->flag_fin = DONT_CARE;
 				door->flag_syn = DONT_CARE;
 				door->flag_rst = DONT_CARE;
@@ -725,6 +748,9 @@ int parseconfig(char *configfile)
 					} else if(!strcmp(key, "CMD_TIMEOUT")) {
 						door->cmd_timeout = (time_t)atoi(ptr);
 						dprint("config: %s: cmd_timeout: %d\n", door->name, door->cmd_timeout);
+					} else if(!strcmp(key, "IPSET_TIMEOUT")) {
+						door->ipset_timeout = (time_t)atoi(ptr);
+						dprint("config: %s: ipset_timeout: %d\n", door->name, door->ipset_timeout);
 					} else if(!strcmp(key, "STOP_COMMAND")) {
 						door->stop_command = malloc(sizeof(char) * (strlen(ptr)+1));
 						if(door->stop_command == NULL) {
@@ -741,6 +767,14 @@ int parseconfig(char *configfile)
 						}
 						strcpy(door->stop_command6, ptr);
 						dprint("config: %s: stop_command_6: %s\n", door->name, door->stop_command6);
+					} else if(!strcmp(key, "IPSET")) {
+						door->ipset_name = malloc(sizeof(char) * (strlen(ptr)+1));
+						if(door->ipset_name == NULL) {
+							perror("malloc");
+							exit(1);
+						}
+						strcpy(door->ipset_name, ptr);
+						dprint("config: %s: ipset: %s\n", door->name, door->ipset_name);
 					} else if(!strcmp(key, "TCPFLAGS")) {
 						char *flag;
 						strtoupper(ptr);
@@ -1287,6 +1321,7 @@ void free_door(opendoor_t *door)
 		free(door->target);
 		free(door->start_command);
 		free(door->stop_command);
+		free(door->ipset_name);
 		if(door->one_time_sequences_fd) {
 			fclose(door->one_time_sequences_fd);
 		}
@@ -1507,12 +1542,15 @@ void process_attempt(knocker_t *attempt)
 	//select
 	char * start_command;
 	char * stop_command;
+	char * ipset_name;
+	char ipset_line_buf[512];
 
 	//select
 	if(attempt->from_ipv6)
 	{
 		start_command = attempt->door->start_command6;
 		stop_command = attempt->door->stop_command6;
+		ipset_name = attempt->door->ipset_name;
 
 		//make default fallback to same than ipv4 if v6 command is not set.
 		if(start_command == NULL) {
@@ -1524,6 +1562,7 @@ void process_attempt(knocker_t *attempt)
 	} else {
 		start_command = attempt->door->start_command;
 		stop_command = attempt->door->stop_command;
+		ipset_name = attempt->door->ipset_name;
 	}
 
 	/* level up! */
@@ -1586,6 +1625,42 @@ void process_attempt(knocker_t *attempt)
 				}
 
 				exit(0); /* exit child */
+			}
+		} else if(ipset_name && strlen(ipset_name)) {
+			snprintf(ipset_line_buf, sizeof(ipset_line_buf), "add -exist %s %s", attempt->door->ipset_name, attempt->src);
+  		if (ipset_parse_line(ipset, ipset_line_buf) < 0) {
+				vprint("%s (%s): %s: ipset_parse_line(%s) status %d, error: %s\n",
+						attempt->src, attempt->srchost, attempt->door->name,
+						ipset_line_buf, ipset_error_status, ipset_error_buf);
+				logprint("%s (%s): %s: ipset_parse_line(%s) status %d, error: %s",
+						attempt->src, attempt->srchost, attempt->door->name,
+						ipset_line_buf, ipset_error_status, ipset_error_buf);
+			} else {
+				if(fork() == 0) {
+					/* child */
+					setsid();
+
+					/* sleep for ipset_timeout and call ipset_parse_line() with del command*/
+					sleep(attempt->door->ipset_timeout);
+					if(attempt->srchost) {
+						vprint("%s (%s): %s: ipset timeout\n", attempt->src, attempt->srchost, attempt->door->name);
+						logprint("%s (%s): %s: ipset timeout", attempt->src, attempt->srchost, attempt->door->name);
+					} else {
+						vprint("%s: %s: ipset timeout\n", attempt->src, attempt->door->name);
+						logprint("%s: %s: ipset timeout", attempt->src, attempt->door->name);
+					}
+					snprintf(ipset_line_buf, sizeof(ipset_line_buf), "del -exist %s %s", attempt->door->ipset_name, attempt->src);
+					if (ipset_parse_line(ipset, ipset_line_buf) < 0) {
+						vprint("%s (%s): %s: ipset_parse_line(%s) status %d, error: %s\n",
+								attempt->src, attempt->srchost, attempt->door->name,
+								ipset_line_buf, ipset_error_status, ipset_error_buf);
+						logprint("%s (%s): %s: ipset_parse_line(%s) status %d, error: %s",
+								attempt->src, attempt->srchost, attempt->door->name,
+								ipset_line_buf, ipset_error_status, ipset_error_buf);
+					}
+
+					exit(0); /* exit child */
+				}
 			}
 		}
 		/* change to next sequence if one time sequences are used.
@@ -1892,6 +1967,25 @@ int target_strcmp(char *ip, char *target) {
 	}
 
 	return 1;
+}
+
+int ipset_printf_custom(struct ipset *ipset, void *p, int status, const char *msg, ...) {
+	va_list ap;
+
+	va_start(ap, msg);
+	(void)vsnprintf(ipset_error_buf, sizeof(ipset_error_buf), msg, ap);
+	va_end(ap);
+	ipset_error_status = status;
+
+	return 0;
+}
+
+int ipset_printf_error(struct ipset *ipset, void *p) {
+	return 0;
+}
+
+int ipset_printf_out(struct ipset_session *session, void *p, const char *fmt, ...) {
+	return 0;
 }
 
 /* vim: set ts=2 sw=2 noet: */

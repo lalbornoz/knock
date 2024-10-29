@@ -141,6 +141,23 @@ of the two protocols.
 	stop_command_6     = /usr/sbin/ip6tables \-D INPUT \-s %IP% \-p tcp \-\-dport 25 \-j ACCEPT
 	
 .fi
+.TP
+.SH Example #5:
+.RS
+Example to support IPv4 and IPv6. Uses an \fBipset\fR(8) instead of a command.
+
+.nf
+[options]
+	logfile = /var/log/knockd.log
+
+[opencloseSMTP]
+	one_time_sequences = /etc/knockd/smtp_sequences
+	seq_timeout        = 15
+	tcpflags           = fin,!ack
+	ipset_timeout      = 5
+	ipset              = smtp_allow
+	
+.fi
 .RE
 .SH CONFIGURATION: GLOBAL DIRECTIVES
 .TP
@@ -221,6 +238,10 @@ doing nothing.
 Time to wait (in seconds) between \fBStart_Command\fP and \fBStop_Command\fP.
 This directive is optional, only required if \fBStop_Command\fP is used.
 .TP
+.B "Ipset_Timeout = <timeout>"
+Time to wait (in seconds) between adding and deleting from an \fBipset\fR(8).
+This directive is optional, only required if \fBIpset\fP is used.
+.TP
 .B "Stop_Command = <command>"
 Specify the command to be executed when \fBCmd_Timeout\fP seconds have passed 
 since \fBStart_Command\fP has been executed.  All instances of \fB%IP%\fP will
@@ -233,6 +254,11 @@ be replaced with the knocker's IP address.  This directive is optional.
 If not present it will automatically fallback onto the same IPV4 
 \fBStop_Command\fP value. You can use empty value to force
 doing nothing.
+.TP
+.B "Ipset = <ipset_name>"
+Specify the name of the \fBipset\fR(8) to add/delete the knocker's IP address
+to/from when \fBIpset_Timeout\fP seconds have passed since adding to the \fBipset\fR(8).
+This directive is optional.
 .SH SECURITY NOTES 
 Using the \fB-l\fP or \fB--lookup\fP commandline option to resolve DNS names
 for log entries may be a security risk!  An attacker may find out the first port
